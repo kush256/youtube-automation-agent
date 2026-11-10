@@ -100,12 +100,14 @@ class ThumbnailDesignerAgent {
     };
 
     const baseConcept = concepts[script.metadata?.strategy?.contentType?.toLowerCase()] || concepts.explainer;
+    const paired = this.splitPairedThumbnailText(script.packaging?.thumbnailText);
     
     return {
       title: this.formatThumbnailTitle(script.title),
       style: baseConcept.style,
-      primaryText: this.extractPrimaryText(script.title),
-      secondaryText: this.generateSecondaryText(script),
+      // yt-package: thumbnail text is written with the title as one unit and never repeats it.
+      primaryText: paired ? paired.primary : this.extractPrimaryText(script.title),
+      secondaryText: paired ? paired.secondary : this.generateSecondaryText(script),
       elements: baseConcept.elements,
       colors: {
         primary: baseConcept.colors[0],
@@ -116,6 +118,23 @@ class ThumbnailDesignerAgent {
       composition: this.selectComposition(),
       effects: this.selectEffects()
     };
+  }
+
+  splitPairedThumbnailText(text) {
+    const words = String(text || '').trim().split(/\s+/).filter(Boolean).slice(0, 3);
+    if (!words.length) return null;
+    // One line holds about 12 characters at the primary size; spill the rest onto the second line.
+    if (words.join(' ').length <= 12 || words.length === 1) return { primary: words.join(' '), secondary: '' };
+    return { primary: words[0], secondary: words.slice(1).join(' ') };
+  }
+
+  escapeSvgText(value) {
+    return String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&apos;');
   }
 
   formatThumbnailTitle(title) {
@@ -280,12 +299,12 @@ class ThumbnailDesignerAgent {
         </style>
         
         <!-- Shadow -->
-        <text x="642" y="302" class="primary shadow">${concept.primaryText}</text>
-        <text x="642" y="402" class="secondary shadow">${concept.secondaryText}</text>
+        <text x="642" y="302" class="primary shadow">${this.escapeSvgText(concept.primaryText)}</text>
+        <text x="642" y="402" class="secondary shadow">${this.escapeSvgText(concept.secondaryText)}</text>
         
         <!-- Main text -->
-        <text x="640" y="300" class="primary">${concept.primaryText}</text>
-        <text x="640" y="400" class="secondary">${concept.secondaryText}</text>
+        <text x="640" y="300" class="primary">${this.escapeSvgText(concept.primaryText)}</text>
+        <text x="640" y="400" class="secondary">${this.escapeSvgText(concept.secondaryText)}</text>
       </svg>
     `;
     

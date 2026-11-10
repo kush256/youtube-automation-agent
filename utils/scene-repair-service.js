@@ -39,10 +39,14 @@ function scriptScenes(script = {}) {
   }
   for (const [index, section] of (script.mainContent?.sections || []).entries()) {
     const scriptText = textFromSection(section);
+    // Beats written with the yt-script method carry an explicit on-screen direction; prefer it.
+    const visual = typeof section.onScreen === 'string' && section.onScreen.trim()
+      ? section.onScreen.trim()
+      : `${section.title || ''}. ${scriptText}`.trim();
     scenes.push({
       label: section.title || `Scene ${index + 1}`,
       scriptText,
-      prompt: `${section.title || ''}. ${scriptText}`.trim() + '. Cinematic explanatory B-roll, natural motion, coherent lighting, no captions or on-screen text.'
+      prompt: `${visual}. Cinematic explanatory B-roll, natural motion, coherent lighting, no captions or on-screen text.`
     });
   }
   if (script.conclusion) {
@@ -55,7 +59,7 @@ function scriptScenes(script = {}) {
   if (script.callToAction) {
     const cta = script.callToAction;
     const scriptText = [cta.subscribe, cta.like, cta.comment, cta.nextVideo]
-      .filter(value => typeof value === 'string').join(' ');
+      .filter(value => typeof value === 'string' && value.trim()).join(' ');
     if (scriptText) scenes.push({
       label: 'Call to action', scriptText,
       prompt: `${scriptText}. Clean closing visual with open composition, no captions or on-screen text.`

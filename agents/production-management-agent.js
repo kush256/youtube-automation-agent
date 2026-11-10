@@ -678,7 +678,10 @@ class ProductionManagementAgent {
     // Content-based prompts
     if (script.mainContent && script.mainContent.sections) {
       script.mainContent.sections.forEach(section => {
-        if (section.title) {
+        if (typeof section.onScreen === 'string' && section.onScreen.trim()) {
+          // yt-script beats say exactly what the viewer should see.
+          prompts.push(`${section.onScreen.trim()}, clear visual storytelling`);
+        } else if (section.title) {
           prompts.push(`${section.title}, relevant explanatory visual`);
         }
       });

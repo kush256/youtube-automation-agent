@@ -121,15 +121,16 @@ class AIVideoGenerator {
 
     try {
       let generatedPath;
-      if (this.elevenLabsApiKey && this.elevenLabsVoiceId) {
+      const preferred = this.preferredTTSProvider();
+      if (preferred === 'elevenlabs') {
         provider = 'elevenlabs';
         model = this.elevenLabsModel;
         generatedPath = await this.generateElevenLabsTTS(text, outputPath);
-      } else if (this.openai) {
+      } else if (preferred === 'openai') {
         provider = 'openai';
         model = 'gpt-4o-mini-tts';
         generatedPath = await this.generateOpenAITTS(text, outputPath);
-      } else if (this.gemini) {
+      } else if (preferred === 'gemini') {
         provider = 'gemini';
         model = process.env.GEMINI_TTS_MODEL || 'gemini-3.8-flash-tts';
         generatedPath = await this.generateGeminiTTS(text, outputPath);
@@ -213,13 +214,41 @@ class AIVideoGenerator {
     return outputPath;
   }
 
+  /**
+   * TTS_PROVIDER=elevenlabs|openai|gemini pins narration to one configured provider (for example,
+   * keep Gemini narration even after adding an OpenAI key for scripts). Unset keeps the default
+   * order: ElevenLabs, then OpenAI, then Gemini.
+   */
+  preferredTTSProvider() {
+    const available = {
+      elevenlabs: Boolean(this.elevenLabsApiKey && this.elevenLabsVoiceId),
+      openai: Boolean(this.openai),
+      gemini: Boolean(this.gemini)
+    };
+    const pinned = String(process.env.TTS_PROVIDER || '').trim().toLowerCase();
+    if (pinned && available[pinned]) return pinned;
+    if (pinned && !available[pinned]) {
+      this.logger.warn(`TTS_PROVIDER=${pinned} is not configured; falling back to the default narration order`);
+    }
+    return ['elevenlabs', 'openai', 'gemini'].find(name => available[name]) || null;
+  }
+
+  /**
+   * Gemini TTS follows a natural-language delivery direction placed before the text. GEMINI_TTS_STYLE
+   * applies the same direction to every scene so the narration keeps one consistent delivery.
+   */
+  buildGeminiTTSPrompt(text) {
+    const style = String(process.env.GEMINI_TTS_STYLE || '').trim().replace(/[:\s]+$/, '');
+    return style ? `${style}:\n${text}` : text;
+  }
+
   async generateGeminiTTS(text, outputPath) {
     const model = process.env.GEMINI_TTS_MODEL || 'gemini-3.8-flash-tts';
     const voiceName = process.env.GEMINI_TTS_VOICE || 'Kore';
 
     const response = await this.gemini.models.generateContent({
       model,
-      contents: [{ parts: [{ text }] }],
+      contents: [{ parts: [{ text: this.buildGeminiTTSPrompt(text) }] }],
       config: {
         responseModalities: ['AUDIO'],
         speechConfig: {

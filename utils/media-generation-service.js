@@ -46,10 +46,16 @@ class MediaGenerationService {
     for (const section of script.mainContent?.sections || []) {
       const detail = typeof section.content === 'string'
         ? section.content
-        : (section.items || section.steps || []).map(item => `${item.title || ''} ${item.description || ''}`).join(' ');
+        : Array.isArray(section.content)
+          ? section.content.filter(line => typeof line === 'string' && !line.startsWith('[')).join(' ')
+          : (section.items || section.steps || []).map(item => `${item.title || ''} ${item.description || ''}`).join(' ');
+      // Beats written with the yt-script method carry an explicit on-screen direction; prefer it.
+      const visual = typeof section.onScreen === 'string' && section.onScreen.trim()
+        ? section.onScreen.trim()
+        : `${section.title || ''}. ${detail}`.trim();
       prompts.push({
         label: section.title || 'Scene',
-        prompt: `${section.title || ''}. ${detail}`.trim() + '. Cinematic explanatory B-roll, natural motion, coherent lighting, no captions or on-screen text.'
+        prompt: `${visual}. Cinematic explanatory B-roll, natural motion, coherent lighting, no captions or on-screen text.`
       });
     }
     if (script.conclusion?.finalThought) {

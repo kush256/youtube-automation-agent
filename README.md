@@ -125,6 +125,7 @@ Details are in the [feature guide](docs/features.md#automation-schedule).
 
 - [Feature guide](docs/features.md): a walkthrough of every studio and gate.
 - [AI providers](docs/providers.md): text, narration, image, and video providers with keys and limits.
+- [Editorial method](docs/editorial-method.md): scored hooks, paired title and thumbnail text, query-tested descriptions, your voice profile, Gemini narration style and upload settings.
 - [API reference](docs/api.md): every HTTP route the dashboard server exposes, for example `POST /generate` with `x-api-key`.
 - [Troubleshooting](docs/troubleshooting.md): fixes for setup, sign-in, and generation problems.
 - [Changelog](CHANGELOG.md) and [releases](https://github.com/darkzOGx/youtube-automation-agent/releases).

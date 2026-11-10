@@ -1,5 +1,14 @@
 const { Logger } = require('../utils/logger');
 const { AITextService } = require('../utils/ai-text-service');
+const {
+  rankHooks,
+  rankTitles,
+  lintTitle,
+  loadVoiceProfile,
+  scriptRules,
+  packagingRules,
+  voiceBlock
+} = require('../utils/youtube-skill-rules');
 
 class ScriptWriterAgent {
   constructor(db, credentials) {
@@ -106,76 +115,228 @@ class ScriptWriterAgent {
       return null;
     }
 
-    const prompt = `You are writing a YouTube script plan.
-Return only valid JSON with this exact shape:
-{
-  "title": "compelling title under 100 characters",
-  "hook": "opening hook in one sentence",
-  "sections": [
-    { "title": "section title", "content": ["spoken script bullet"], "duration": 60 }
-  ],
-  "cta": "clear call to action",
-  "claims": [
-    { "text": "specific factual claim a reviewer must verify", "riskLevel": "standard|high", "sourceUrls": ["exact supplied source URL"] }
-  ]
-}
-
-Topic: ${strategy.topic}
-Style/content type: ${strategy.contentType}
-Angle: ${strategy.angle}
-Target audience: ${strategy.targetAudience}
-Desired length: ${strategy.requestedLength || process.env.DEFAULT_VIDEO_LENGTH || '8-12 minutes'}
-Tone: ${template.tone}
-Pacing: ${template.pacing}
-Brand voice: ${strategy.brandVoice || 'clear, credible, and engaging'}
-Channel goal: ${strategy.channelGoal || 'help the viewer understand and act'}
-Channel value proposition: ${strategy.channelValueProposition || 'give the viewer practical value'}
-Editorial rationale: ${strategy.planRationale || 'fit the selected topic and audience'}
-Channel constraints: ${strategy.channelConstraints || 'none beyond the factual-safety rules below'}
-Preferred call to action: ${strategy.callToAction || 'invite the viewer to subscribe'}
-Keywords: ${(strategy.keywords || []).join(', ')}
-Research sources: ${JSON.stringify(strategy.researchSources || [])}
-Avoid fabricated statistics, unsupported claims, and fake urgency. List every externally verifiable factual claim in claims. Use only exact URLs from Research sources; use an empty sourceUrls array when the supplied sources do not support a claim.`;
+    const prompt = this.buildSkillScriptPrompt(strategy, template);
 
     try {
       const response = await this.aiTextService.generateText(prompt, {
-        maxTokens: 1800,
+        maxTokens: 4000,
         temperature: 0.7
       });
       const parsed = this.parseAIJsonResponse(response);
       const sections = this.normalizeAISections(parsed.sections, strategy);
 
-      if (!parsed.title || !parsed.hook || sections.length === 0) {
-        throw new Error('AI script response missing required fields');
+      let rankedHooks = rankHooks(this.hookTexts(parsed));
+      if (rankedHooks.length === 0 || !parsed.turn || sections.length === 0) {
+        throw new Error('AI script response missing required fields (hooks, turn or sections)');
       }
 
-      this.logger.info(`Using AI script generation via ${this.aiTextService.providerName}`);
+      // yt-script: never hand over a weak hook. One rewrite pass aimed at the weakest property.
+      if (rankedHooks[0].band === 'WEAK') {
+        rankedHooks = await this.reviseWeakHooks(strategy, parsed, rankedHooks);
+      }
+
+      const packaging = this.selectPackaging(parsed, strategy);
+      const bestHook = rankedHooks[0];
+      const payoff = this.cleanSpoken(parsed.payoff);
+      const ask = this.cleanSpoken(parsed.cta) || strategy.callToAction || `Subscribe for more on ${strategy.topic}.`;
+
+      this.logger.info(`Using AI script generation via ${this.aiTextService.providerName}; hook ${bestHook.verdict}/100 (${bestHook.band}, ${bestHook.formula})`);
       return {
-        title: String(parsed.title).slice(0, 100),
-        hook: this.normalizeAIHook(parsed.hook),
-        introduction: await this.generateIntroduction(strategy),
+        title: packaging.title,
+        hook: {
+          type: bestHook.formulaId || 'ai',
+          text: bestHook.hook,
+          duration: '0:00-0:15',
+          score: bestHook.verdict,
+          band: bestHook.band,
+          formula: bestHook.formula
+        },
+        // The turn replaces the old template intro: no greeting, no channel intro, no credibility filler.
+        introduction: {
+          greeting: '',
+          topicIntro: this.cleanSpoken(parsed.turn),
+          valueProposition: '',
+          credibility: '',
+          duration: '0:15-0:45'
+        },
         mainContent: {
           sections,
           totalDuration: this.calculateSectionsDuration(sections)
         },
-        conclusion: await this.generateConclusion(strategy),
-        callToAction: this.normalizeAICTA(parsed.cta, strategy),
-        duration: this.estimateDuration({ sections }),
+        conclusion: {
+          type: 'conclusion',
+          title: 'Payoff',
+          recap: [],
+          finalThought: payoff,
+          duration: `${this.spokenSeconds(payoff)} seconds`
+        },
+        // yt-script: one ask, not three.
+        callToAction: {
+          type: 'call_to_action',
+          subscribe: ask,
+          like: '',
+          comment: '',
+          nextVideo: '',
+          duration: `${this.spokenSeconds(ask)} seconds`
+        },
+        duration: this.estimateSpokenDuration([bestHook.hook, parsed.turn, ...sections.flatMap(s => s.content), payoff, ask]),
         tone: template.tone,
         pacing: template.pacing,
         keywords: strategy.keywords || [],
         claims: this.normalizeAIClaims(parsed.claims, strategy.researchSources || []),
+        packaging,
         metadata: {
           strategy,
           generatedAt: new Date().toISOString(),
-          version: '1.0',
-          generationSource: 'ai'
+          version: '2.0',
+          generationSource: 'ai',
+          editorialMethod: 'youtube-agent-skill/yt-script',
+          voiceProfileUsed: Boolean(loadVoiceProfile()),
+          hookCandidates: rankedHooks.map(hook => ({
+            text: hook.hook,
+            score: hook.verdict,
+            band: hook.band,
+            formula: hook.formula,
+            weakest: hook.weakest,
+            fix: hook.fix,
+            properties: hook.properties
+          })),
+          formulaRationale: this.cleanSpoken(parsed.formulaRationale)
         }
       };
     } catch (error) {
       this.logger.warn(`AI script generation failed; using template fallback: ${error.message}`);
       return null;
     }
+  }
+
+  buildSkillScriptPrompt(strategy, template) {
+    const voice = voiceBlock();
+    return `You are writing a YouTube video script that a text-to-speech voice will narrate over generated visuals.
+Return only valid JSON with this exact shape:
+{
+  "hooks": [
+    { "text": "spoken hook, 9-24 words", "formula": "formula id from the list" }
+  ],
+  "formulaRationale": "one line: which formula the strongest hook uses and why it fits this idea",
+  "titleOptions": ["ten different title options"],
+  "thumbnailText": "max three words, sharing no word with the titles",
+  "turn": "one spoken sentence saying what this video will do, then starting to do it",
+  "sections": [
+    {
+      "title": "beat title",
+      "content": ["spoken line", "spoken line"],
+      "onScreen": "what the viewer sees during this beat, as a concrete visual description"
+    }
+  ],
+  "payoff": "spoken lines that explicitly deliver what the hook promised",
+  "cta": "one single spoken ask",
+  "claims": [
+    { "text": "specific factual claim a reviewer must verify", "riskLevel": "standard|high", "sourceUrls": ["exact supplied source URL"] }
+  ]
+}
+Provide exactly five hooks and ten titleOptions. Use 3-8 sections.
+
+${scriptRules()}
+
+${packagingRules()}
+
+${voice}
+
+VIDEO BRIEF
+Topic: ${strategy.topic}
+Style/content type: ${strategy.contentType}
+Angle: ${strategy.angle}
+Target audience: ${strategy.targetAudience}
+Desired length: ${strategy.requestedLength || process.env.DEFAULT_VIDEO_LENGTH || '8-12 minutes'} (about 150 spoken words per minute)
+Tone: ${template.tone}
+Pacing: ${template.pacing}
+Brand voice: ${strategy.brandVoice || 'clear, credible, and engaging'}
+Channel goal: ${strategy.channelGoal || 'help the viewer understand and act'}
+Channel value proposition: ${strategy.channelValueProposition || 'give the viewer practical value'}
+Editorial rationale: ${strategy.planRationale || 'fit the selected topic and audience'}
+Channel constraints: ${strategy.channelConstraints || 'none beyond the factual-safety rules'}
+Preferred call to action: ${strategy.callToAction || 'invite the viewer to subscribe'}
+Keywords: ${(strategy.keywords || []).join(', ')}
+Research sources: ${JSON.stringify(strategy.researchSources || [])}
+Avoid fabricated statistics, unsupported claims, and fake urgency. List every externally verifiable factual claim in claims. Use only exact URLs from Research sources; use an empty sourceUrls array when the supplied sources do not support a claim.`;
+  }
+
+  hookTexts(parsed) {
+    const hooks = Array.isArray(parsed.hooks) ? parsed.hooks : [];
+    const texts = hooks.map(hook => (typeof hook === 'object' && hook !== null ? hook.text : hook));
+    if (parsed.hook) texts.push(typeof parsed.hook === 'object' ? parsed.hook.text : parsed.hook);
+    return texts.map(text => this.cleanSpoken(text)).filter(Boolean);
+  }
+
+  async reviseWeakHooks(strategy, parsed, rankedHooks) {
+    const feedback = rankedHooks.slice(0, 5)
+      .map(hook => `- "${hook.hook}" scored ${hook.verdict}/100 (${hook.band}); weakest ${hook.weakest}: ${hook.fix}`)
+      .join('\n');
+    const prompt = `Five YouTube hooks were scored and all are weak. Rewrite them.
+Return only valid JSON: { "hooks": [ { "text": "spoken hook, 9-24 words", "formula": "formula id" } ] } with exactly five hooks.
+
+Video topic: ${strategy.topic}
+Angle: ${strategy.angle}
+The turn that follows the hook: ${this.cleanSpoken(parsed.turn)}
+
+Scores and the fix each one needs:
+${feedback}
+
+${scriptRules()}
+
+${voiceBlock()}`;
+    try {
+      const response = await this.aiTextService.generateText(prompt, { maxTokens: 1200, temperature: 0.8 });
+      const revised = rankHooks(this.hookTexts(this.parseAIJsonResponse(response)));
+      const merged = [...rankedHooks, ...revised].sort((a, b) => b.verdict - a.verdict);
+      this.logger.info(`Hook revision pass: best ${rankedHooks[0].verdict} -> ${merged[0].verdict}`);
+      return merged;
+    } catch (error) {
+      this.logger.warn(`Hook revision pass failed; keeping the best original hook: ${error.message}`);
+      return rankedHooks;
+    }
+  }
+
+  selectPackaging(parsed, strategy) {
+    const thumbnailText = this.cleanSpoken(parsed.thumbnailText)
+      .split(/\s+/).filter(Boolean).slice(0, 3).join(' ').toUpperCase();
+    const options = Array.isArray(parsed.titleOptions) ? parsed.titleOptions : [];
+    if (parsed.title) options.push(parsed.title);
+    const ranked = rankTitles(options, thumbnailText || null);
+    const fallback = String(strategy.angle || strategy.topic || 'Untitled video').slice(0, 100);
+    const best = ranked[0] || lintTitle(fallback, thumbnailText || null);
+    return {
+      title: best.title,
+      titleScore: best.score,
+      titleIssues: best.issues.map(issue => `${issue.code}: ${issue.message}`),
+      thumbnailText,
+      titleCandidates: ranked.slice(0, 3).map(item => ({
+        title: item.title,
+        score: item.score,
+        issues: item.issues.map(issue => `${issue.code}: ${issue.message}`)
+      }))
+    };
+  }
+
+  cleanSpoken(value) {
+    if (value === null || value === undefined) return '';
+    const text = Array.isArray(value) ? value.join(' ') : (typeof value === 'object' ? value.text || '' : value);
+    return String(text)
+      .replace(/\[[^\]]*\]/g, ' ')
+      .replace(/[*_#`]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  spokenSeconds(text) {
+    const words = String(text || '').split(/\s+/).filter(Boolean).length;
+    return Math.max(1, Math.round(words / 2.5));
+  }
+
+  estimateSpokenDuration(lines) {
+    const seconds = lines.reduce((total, line) => total + this.spokenSeconds(this.cleanSpoken(line)), 0);
+    return this.formatDuration(seconds);
   }
 
   parseAIJsonResponse(response) {
@@ -218,15 +379,23 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
           : [section.content || section.summary || section.description];
         const content = rawContent
           .filter(Boolean)
-          .map(line => String(line).trim())
+          .map(line => this.cleanSpoken(line))
           .filter(Boolean);
+        const onScreen = this.cleanSpoken(section.onScreen || section.visual || section.visuals);
+        // Duration from the words actually spoken (150 wpm), not the model's guess.
+        const spoken = content.reduce((total, line) => total + this.spokenSeconds(line), 0);
 
-        return {
+        const normalized = {
           type: 'ai_generated',
           title: String(section.title || `${strategy.topic} Part ${index + 1}`).trim(),
           content,
-          duration: parseInt(section.duration, 10) || 60
+          duration: spoken || parseInt(section.duration, 10) || 60
         };
+        if (onScreen) {
+          normalized.onScreen = onScreen;
+          normalized.visuals = [onScreen];
+        }
+        return normalized;
       })
       .filter(section => section.title && section.content.length > 0);
   }
@@ -686,15 +855,18 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
     fullScript += '═'.repeat(50) + '\n\n';
     
     // Hook
-    fullScript += `[${script.hook.duration}] HOOK\n`;
+    const hookScore = Number.isFinite(script.hook.score)
+      ? ` (score ${script.hook.score}/100 ${script.hook.band}, ${script.hook.formula})`
+      : '';
+    fullScript += `[${script.hook.duration}] HOOK${hookScore}\n`;
     fullScript += `${script.hook.text}\n\n`;
     
     // Introduction
-    fullScript += `[${script.introduction.duration}] INTRODUCTION\n`;
-    fullScript += `${script.introduction.greeting}\n`;
-    fullScript += `${script.introduction.topicIntro}\n`;
-    fullScript += `${script.introduction.valueProposition}\n`;
-    fullScript += `${script.introduction.credibility}\n\n`;
+    fullScript += `[${script.introduction.duration}] ${script.metadata?.editorialMethod ? 'THE TURN' : 'INTRODUCTION'}\n`;
+    [script.introduction.greeting, script.introduction.topicIntro, script.introduction.valueProposition, script.introduction.credibility]
+      .filter(Boolean)
+      .forEach(line => { fullScript += `${line}\n`; });
+    fullScript += '\n';
     
     // Main Content
     fullScript += 'MAIN CONTENT\n';
@@ -743,10 +915,22 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
     
     // Call to Action
     fullScript += `[${script.callToAction.duration}] CALL TO ACTION\n`;
-    fullScript += `${script.callToAction.subscribe}\n`;
-    fullScript += `${script.callToAction.like}\n`;
-    fullScript += `${script.callToAction.comment}\n`;
-    fullScript += `${script.callToAction.nextVideo}\n\n`;
+    [script.callToAction.subscribe, script.callToAction.like, script.callToAction.comment, script.callToAction.nextVideo]
+      .filter(Boolean)
+      .forEach(line => { fullScript += `${line}\n`; });
+    fullScript += '\n';
+
+    // Packaging and hook review (yt-script / yt-package)
+    if (script.packaging?.thumbnailText) {
+      fullScript += `THUMBNAIL TEXT: ${script.packaging.thumbnailText}\n`;
+      fullScript += `TITLE SCORE: ${script.packaging.titleScore}/100${script.packaging.titleIssues.length ? ` (${script.packaging.titleIssues.join('; ')})` : ''}\n`;
+    }
+    if (Array.isArray(script.metadata?.hookCandidates) && script.metadata.hookCandidates.length > 1) {
+      fullScript += 'HOOK OPTIONS:\n';
+      script.metadata.hookCandidates.slice(0, 3).forEach(hook => {
+        fullScript += `  ${hook.score}/100 ${hook.band} [${hook.formula}] ${hook.text}\n`;
+      });
+    }
     
     // Metadata
     fullScript += '═'.repeat(50) + '\n';

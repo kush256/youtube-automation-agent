@@ -219,7 +219,7 @@ class PublishingSchedulingAgent {
       },
       status: {
         privacyStatus: futureSchedule ? 'private' : requestedPrivacy,
-        selfDeclaredMadeForKids: false,
+        selfDeclaredMadeForKids: this.madeForKids(),
         containsSyntheticMedia: metadata.containsSyntheticMedia === true
       }
     };
@@ -253,8 +253,42 @@ class PublishingSchedulingAgent {
     if (metadata.captions && metadata.captions.path) {
       await this.uploadCaptions(videoId, metadata.captions.path);
     }
+
+    // Add to the channel's playlist
+    const playlistId = String(metadata.playlistId || process.env.YOUTUBE_PLAYLIST_ID || '').trim();
+    if (playlistId) {
+      await this.addToPlaylist(videoId, playlistId);
+    }
     
     return videoUpload.data;
+  }
+
+  /**
+   * YouTube requires an audience declaration on every upload. MADE_FOR_KIDS=true marks uploads as
+   * made for kids (COPPA); anything else declares them not made for kids, the previous behaviour.
+   */
+  madeForKids() {
+    return /^(1|true|yes)$/i.test(String(process.env.MADE_FOR_KIDS || '').trim());
+  }
+
+  async addToPlaylist(videoId, playlistId) {
+    try {
+      await this.youtube.playlistItems.insert({
+        part: 'snippet',
+        requestBody: {
+          snippet: {
+            playlistId,
+            resourceId: { kind: 'youtube#video', videoId }
+          }
+        }
+      });
+      this.logger.info(`Added ${videoId} to playlist ${playlistId}`);
+      return true;
+    } catch (error) {
+      // The video is already uploaded; a playlist failure must not mark the upload as failed.
+      this.logger.error(`Failed to add ${videoId} to playlist ${playlistId}: ${error.message}`);
+      return false;
+    }
   }
 
   async isNarrationReady(audio = {}) {

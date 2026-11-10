@@ -91,3 +91,6 @@ data/thumbnails/
 
 # Claude worktrees
 .claude/worktrees/
+
+# Personal editorial voice profile (see config/voice.example.md)
+config/voice.md

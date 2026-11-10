@@ -1,5 +1,6 @@
 const { Logger } = require('../utils/logger');
 const { AITextService } = require('../utils/ai-text-service');
+const { rankTitles, packagingRules, seoRules, voiceBlock } = require('../utils/youtube-skill-rules');
 
 class SEOOptimizerAgent {
   constructor(db, credentials) {
@@ -33,9 +34,11 @@ class SEOOptimizerAgent {
       
       const aiSEO = await this.generateSEOWithAI(script, strategy);
       let title, description, tags;
+      let searchQueries = [];
+      let titleReview = null;
 
       if (aiSEO) {
-        ({ title, description, tags } = aiSEO);
+        ({ title, description, tags, searchQueries, titleReview } = aiSEO);
       } else {
         this.logger.info('Using template SEO optimization');
         // Generate optimized title
@@ -68,11 +71,13 @@ class SEOOptimizerAgent {
         chapters,
         endScreen,
         seoScore,
+        searchQueries,
+        titleReview,
         metadata: {
           primaryKeyword: strategy.keywords[0],
           secondaryKeywords: strategy.keywords.slice(1, 5),
           targetLength: this.calculateOptimalLength(strategy.contentType),
-          language: 'en',
+          language: this.defaultLanguage(),
           category: this.selectCategory(strategy)
         },
         createdAt: new Date().toISOString()
@@ -95,44 +100,104 @@ class SEOOptimizerAgent {
       return null;
     }
 
-    const prompt = `You are optimizing YouTube metadata.
+    const thumbnailText = script.packaging?.thumbnailText || '';
+    const sectionTitles = (script.mainContent?.sections || []).map(section => section.title).filter(Boolean);
+    const prompt = `You are writing the search-facing metadata for a YouTube video.
 Return only valid JSON with this exact shape:
 {
-  "title": "SEO title under 100 characters",
-  "description": "YouTube description with useful summary and timestamps if relevant",
+  "searchQueries": ["the three queries a real person types that this video should win"],
+  "titleOptions": ["up to five title options that contain the words of those queries"],
+  "description": "YouTube description: two strong opening lines, then any resource, then the longer version",
   "tags": ["tag"]
 }
 
-Video title: ${script.title}
+${seoRules()}
+
+${packagingRules()}
+
+${voiceBlock()}
+
+VIDEO
+Current title: ${script.title}
+Thumbnail text (already designed; titles must not repeat these words): ${thumbnailText || 'none'}
+Hook: ${script.hook?.text || ''}
+Beats: ${sectionTitles.join(' | ')}
 Topic: ${strategy.topic}
 Angle: ${strategy.angle}
 Content type: ${strategy.contentType}
 Target audience: ${strategy.targetAudience}
 Keywords: ${(strategy.keywords || []).join(', ')}
-Keep tags under YouTube's 500 character total guidance. Avoid fabricated statistics and unsupported claims.`;
+Keep tags under YouTube's 500 character total. Avoid fabricated statistics and unsupported claims.`;
 
     try {
       const response = await this.aiTextService.generateText(prompt, {
-        maxTokens: 1400,
+        maxTokens: 2000,
         temperature: 0.6
       });
       const parsed = this.parseAIJsonResponse(response);
-      const tags = this.normalizeAITags(parsed.tags, strategy);
+      const tags = this.normalizeAITags(parsed.tags, strategy).slice(0, 15);
 
-      if (!parsed.title || !parsed.description || tags.length === 0) {
+      if (!parsed.description || tags.length === 0) {
         throw new Error('AI SEO response missing required fields');
       }
 
-      this.logger.info(`Using AI SEO optimization via ${this.aiTextService.providerName}`);
+      const searchQueries = (Array.isArray(parsed.searchQueries) ? parsed.searchQueries : [])
+        .map(query => String(query || '').trim())
+        .filter(Boolean)
+        .slice(0, 3);
+      const titleReview = this.pickTitle(script.title, parsed.titleOptions || parsed.title, thumbnailText, searchQueries);
+
+      this.logger.info(`Using AI SEO optimization via ${this.aiTextService.providerName}; title score ${titleReview.score}/100`);
       return {
-        title: String(parsed.title).trim().slice(0, 100),
-        description: String(parsed.description).trim().slice(0, 5000),
-        tags
+        title: titleReview.title,
+        description: this.stripTimestampLines(String(parsed.description).trim()).slice(0, 5000),
+        tags,
+        searchQueries,
+        titleReview
       };
     } catch (error) {
       this.logger.warn(`AI SEO optimization failed; using template fallback: ${error.message}`);
       return null;
     }
+  }
+
+  /**
+   * yt-package lint plus the yt-seo query test: a title that misses the words people type loses
+   * points, so a slightly longer title that wins the query can beat a tidy one that does not.
+   */
+  pickTitle(currentTitle, options, thumbnailText, searchQueries) {
+    const candidates = [currentTitle, ...(Array.isArray(options) ? options : [options])].filter(Boolean);
+    const stop = new Set(['the', 'a', 'an', 'of', 'for', 'to', 'in', 'on', 'and', 'or', 'is', 'are', 'with', 'how', 'what', 'why', 'do', 'does', 'i', 'my', 'your', 'you']);
+    const queryWords = [...new Set(searchQueries.join(' ').toLowerCase().match(/[a-z0-9']+/g) || [])]
+      .filter(word => !stop.has(word));
+    const ranked = rankTitles(candidates, thumbnailText || null).map(item => {
+      const words = new Set(item.title.toLowerCase().match(/[a-z0-9']+/g) || []);
+      const coverage = queryWords.length ? queryWords.filter(word => words.has(word)).length / queryWords.length : 1;
+      return { ...item, queryCoverage: Math.round(coverage * 100), combined: item.score + Math.round(coverage * 20) };
+    }).sort((a, b) => b.combined - a.combined);
+    const best = ranked[0] || { title: String(currentTitle || '').slice(0, 100), score: 0, issues: [], queryCoverage: 0 };
+    return {
+      title: best.title,
+      score: best.score,
+      queryCoverage: best.queryCoverage,
+      issues: (best.issues || []).map(issue => `${issue.code}: ${issue.message}`),
+      alternatives: ranked.slice(1, 3).map(item => ({ title: item.title, score: item.score, queryCoverage: item.queryCoverage }))
+    };
+  }
+
+  stripTimestampLines(description) {
+    // Chapters must match the rendered audio; model-guessed timestamps are removed.
+    return description
+      .split('\n')
+      .filter(line => !/^\s*\(?\d{1,2}:\d{2}(:\d{2})?\)?\s*[-–—:]?\s+\S/.test(line))
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  defaultLanguage() {
+    const configured = String(process.env.DEFAULT_LANGUAGE || '').trim();
+    return /^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(configured) ? configured : 'en';
   }
 
   parseAIJsonResponse(response) {
@@ -606,6 +671,9 @@ Keep tags under YouTube's 500 character total guidance. Avoid fabricated statist
   }
 
   selectCategory(strategy) {
+    const configured = String(process.env.DEFAULT_CATEGORY_ID || '').trim();
+    if (/^\d{1,3}$/.test(configured)) return Number(configured);
+
     const categories = {
       'technology': 28, // Science & Technology
       'gaming': 20, // Gaming
